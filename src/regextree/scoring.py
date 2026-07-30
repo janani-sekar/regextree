@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Literal
+
 import numpy as np
+
+ObjectiveName = Literal["cross_entropy", "f1", "precision", "recall"]
+ObjectiveFn = Callable[[np.ndarray, np.ndarray, int], float]
 
 
 def softmax(logits: np.ndarray) -> np.ndarray:
@@ -50,6 +56,30 @@ def find_hardest_class(gradients: np.ndarray, labels: np.ndarray) -> int:
     return int(np.argmax(class_need))
 
 
+def negative_match_rate(
+    regex_matches: np.ndarray,
+    labels: np.ndarray,
+    target_class: int,
+) -> float:
+    """Fraction of non-target samples matched by a candidate regex."""
+    neg_mask = labels != target_class
+    if not neg_mask.any():
+        return 0.0
+    return float(regex_matches[neg_mask].mean())
+
+
+def passes_negative_match_gate(
+    regex_matches: np.ndarray,
+    labels: np.ndarray,
+    target_class: int,
+    max_negative_match_rate: float | None,
+) -> bool:
+    """Reject candidates that fire on too large a share of negatives."""
+    if max_negative_match_rate is None:
+        return True
+    return negative_match_rate(regex_matches, labels, target_class) <= max_negative_match_rate
+
+
 def score_candidate(
     regex_matches: np.ndarray,
     gradients: np.ndarray,
@@ -61,11 +91,8 @@ def score_candidate(
     The "gain" is the dot product of the match indicator with the negative
     gradient for target_class (i.e., how much the matching samples need this class).
     """
-    # negative gradient = how much this sample needs more logit for target_class
     need = -gradients[:, target_class]
-    # Only count positive need (samples that actually need this class boosted)
     gain_if_match = np.where(regex_matches, need, 0.0).sum()
-    # Penalize false positives: samples that DON'T need this class but would get it
     penalty = np.where(regex_matches, np.maximum(0.0, -need), 0.0).sum()
     return gain_if_match - penalty
 
@@ -85,9 +112,71 @@ def compute_rule_weight(
         return 0.0
 
     grad_sum = gradients[regex_matches, target_class].sum()
-    # Hessian for softmax cross-entropy: p * (1 - p)
-    # But we don't have probs stored separately, so use a simpler approach:
-    # weight = eta * (-grad_sum / n_matched), clamped for stability
     n_matched = regex_matches.sum()
     raw_weight = -grad_sum / max(n_matched, 1.0)
     return float(eta * np.clip(raw_weight, -2.0, 2.0))
+
+
+def classification_scores(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    target_class: int,
+) -> tuple[float, float, float]:
+    """Return precision, recall, and F1 for a single target class."""
+    preds = logits.argmax(axis=1)
+    tp = int(((preds == target_class) & (labels == target_class)).sum())
+    fp = int(((preds == target_class) & (labels != target_class)).sum())
+    fn = int(((preds != target_class) & (labels == target_class)).sum())
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return precision, recall, f1
+
+
+def evaluate_objective(
+    objective: ObjectiveName | ObjectiveFn,
+    logits: np.ndarray,
+    labels: np.ndarray,
+    target_class: int,
+) -> float:
+    """Score logits under an objective. Higher is better."""
+    if callable(objective):
+        return float(objective(logits, labels, target_class))
+
+    if objective == "cross_entropy":
+        return -cross_entropy_loss(logits, labels)
+    if objective == "precision":
+        return classification_scores(logits, labels, target_class)[0]
+    if objective == "recall":
+        return classification_scores(logits, labels, target_class)[1]
+    if objective == "f1":
+        return classification_scores(logits, labels, target_class)[2]
+    raise ValueError(
+        f"Unknown objective {objective!r}. "
+        "Use 'cross_entropy', 'f1', 'precision', 'recall', or pass a callable."
+    )
+
+
+def evaluate_candidate(
+    regex_matches: np.ndarray,
+    logits: np.ndarray,
+    gradients: np.ndarray,
+    labels: np.ndarray,
+    target_class: int,
+    eta: float,
+    objective: ObjectiveName | ObjectiveFn = "cross_entropy",
+    max_negative_match_rate: float | None = None,
+) -> tuple[float, float]:
+    """Score a candidate regex and return (objective_score, rule_weight)."""
+    if not passes_negative_match_gate(regex_matches, labels, target_class, max_negative_match_rate):
+        return -float("inf"), 0.0
+
+    weight = compute_rule_weight(regex_matches, gradients, target_class, eta)
+    if abs(weight) < 1e-8:
+        return -float("inf"), 0.0
+
+    new_logits = logits.copy()
+    new_logits[regex_matches, target_class] += weight
+    score = evaluate_objective(objective, new_logits, labels, target_class)
+    return score, weight

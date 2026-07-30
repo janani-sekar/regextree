@@ -6,7 +6,11 @@ from regextree.scoring import (
     compute_gradients,
     compute_rule_weight,
     cross_entropy_loss,
+    evaluate_candidate,
+    evaluate_objective,
     find_hardest_class,
+    negative_match_rate,
+    passes_negative_match_gate,
     score_candidate,
     softmax,
 )
@@ -87,5 +91,40 @@ def test_compute_rule_weight():
     ])
     matches = np.array([True, True, False])
     weight = compute_rule_weight(matches, grads, target_class=0, eta=0.2)
-    # Both matched samples have negative gradient for class 0 → positive weight
     assert weight > 0
+
+
+def test_negative_match_rate():
+    labels = np.array([0, 0, 1, 1])
+    matches = np.array([True, False, True, False])
+    assert negative_match_rate(matches, labels, target_class=0) == 0.5
+
+
+def test_evaluate_objective_precision():
+    logits = np.array([
+        [0.0, 5.0],
+        [0.0, 5.0],
+        [5.0, 0.0],
+        [5.0, 0.0],
+    ])
+    labels = np.array([1, 1, 0, 0])
+    score = evaluate_objective("precision", logits, labels, target_class=1)
+    assert score == 1.0
+
+
+def test_evaluate_candidate_rejects_broad_regex():
+    logits = np.zeros((4, 2))
+    labels = np.array([1, 1, 0, 0])
+    grads = compute_gradients(logits, labels)
+    broad_matches = np.array([True, True, True, False])
+    score, weight = evaluate_candidate(
+        broad_matches,
+        logits,
+        grads,
+        labels,
+        target_class=1,
+        eta=0.2,
+        max_negative_match_rate=0.25,
+    )
+    assert score == -float("inf")
+    assert weight == 0.0

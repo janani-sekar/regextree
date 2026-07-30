@@ -1,18 +1,105 @@
 # regextree
 
-Interpretable text categorization using LLM-generated regex patterns as weak learners in a gradient boosting (or decision tree) framework.
+Interpretable text categorization for math education research. The library provides two complementary approaches:
+
+1. **Regex boosting** — LLM-generated regex patterns as weak learners in a gradient boosting framework (step-level clustering).
+2. **Manipulation rules** — sympy-based candidate/realized matching for transition-level misconception discovery.
+
+For Claude-agent-based discovery (Docker orchestration, prompts, eval loops), see the companion project **[regextree-agent](../regextree-agent/)** (`01_score_baseline.py` → `02_discover_cluster.py`; see that repo’s `WRITEUP.md` for James).
 
 ## Install
 
 ```bash
-cd /Users/jsekar/repos/regextree
+cd regextree
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Requires `GEMINI_API_KEY` in environment (or pass `api_key=` directly). A `.env` file is included locally.
+Regex boosting requires `GEMINI_API_KEY` in environment (or pass `api_key=` directly).
 
-## Quick Start
+## Manipulation rules
+
+A manipulation rule predicts student errors on expression transitions:
+
+- **Candidate** — `apply_fn(prev_expr)` returns a non-empty list of plausible wrong next expressions
+- **Realized** — the observed next expression matches one of those outputs (incorrect steps only)
+- **Predict** — candidate and realized (used for 1-vs-all cluster label matching)
+
+This mirrors the logic in `s32_evaluate_manipulations.py`.
+
+```python
+import sympy
+from regextree import ManipulationRule, evaluate_rule_on_transitions
+
+def apply_sign(prev_expr):
+    if not isinstance(prev_expr, sympy.Equality):
+        return []
+    lhs, rhs = prev_expr.args
+    if not lhs.is_Add:
+        return []
+    outputs = []
+    for arg in lhs.args:
+        if arg.is_Symbol:
+            continue
+        remaining = [a for a in lhs.args if a != arg]
+        new_lhs = sympy.Add(*remaining, evaluate=False) if len(remaining) > 1 else remaining[0]
+        new_rhs = sympy.Add(arg, rhs, evaluate=False)
+        outputs.append(sympy.Eq(new_lhs, new_rhs, evaluate=False))
+    return outputs
+
+rule = ManipulationRule(
+    name="sign_error",
+    description="Term moved across '=' without sign change.",
+    apply_fn=apply_sign,
+)
+
+prev = sympy.Eq(sympy.Symbol("x") + 3, 12, evaluate=False)
+curr = sympy.Eq(sympy.Symbol("x"), 15, evaluate=False)
+
+rule.candidate(prev)   # True
+rule.realized(prev, curr, step_correct=False)  # True
+rule.predict(prev, curr, step_correct=False)   # True
+```
+
+### Scoring against cluster labels
+
+The package scores how well a rule's predictions match binary cluster labels. Out-of-sample ANOVA / incremental variance evaluation (student type beyond ability + difficulty) is the user's responsibility.
+
+```python
+metrics = evaluate_rule_on_transitions(
+    df,
+    rule,
+    prev_expr_col="prev_expr",
+    curr_expr_col="curr_expr",
+    label_col="label",              # 1 = in target transition cluster
+    step_correct_col="step_correct",  # optional, for false-positive rate
+)
+# metrics: precision, recall, f1, n_candidate, false_positive_rate, ...
+```
+
+### Loading discovered rules
+
+External agents write a Python module with a `rule` object. The library loads it deterministically:
+
+```python
+from regextree import load_rule_from_module
+
+rule = load_rule_from_module("exports/results.py")
+```
+
+Expected export format:
+
+```python
+# exports/results.py
+from regextree import ManipulationRule
+
+def apply_my_manipulation(prev_expr):
+    ...
+
+rule = ManipulationRule(name="...", description="...", apply_fn=apply_my_manipulation)
+```
+
+## Regex boosting
 
 ```python
 import regextree
@@ -22,59 +109,53 @@ model = regextree.RegexBoostClassifier(
     step_count=5,
     eta=0.2,
     llm="gemini",
+    objective="precision",              # or "f1", "recall", "cross_entropy"
+    max_negative_match_rate=0.05,
+    weight_method="lasso",              # or "gradient"
 )
 model.fit(x_train, y_train, eval_set={"val": (x_val, y_val)})
 
 y_pred = model.predict(x_test)
-
-# Interpretability
-model.patterns()       # {rule_id: r"...", ...}
-model.description()    # {rule_id: "human description", ...}
-model.rules()          # List[Rule] with .regex, .target_class, .weight
-match_df = model.matches(x_test)  # DataFrame of boolean pattern matches
+model.patterns()
+model.rules()
 ```
 
-## How It Works
+The `.fit()` loop is a convenience wrapper over three explicit phases:
 
-Each boosting round:
-1. Computes per-sample gradients (softmax cross-entropy)
-2. Identifies the hardest class (highest mean negative gradient)
-3. Samples hard positives/negatives weighted by gradient magnitude
-4. Prompts Gemini for `pool_size` candidate regex patterns
-5. Evaluates candidates by gradient-weighted information gain
-6. Selects the best pattern and adds it as a weighted rule
+```python
+round_data = model.generate_round(x, labels, logits, step=0)  # LLM call
+selected = model.select_candidate(round_data, x, labels, logits)
+rule = model.add_rule(selected, step=0)
+model.refit_weights(x, labels)  # when weight_method="lasso"
+```
 
-Final prediction: sum rule weights per class for matching patterns, argmax.
+Pass `subgroup_labels=` (e.g. cluster IDs) to prefer structurally similar confusers in negative sampling.
 
 ## Architecture
 
 | Module | Role |
 |--------|------|
+| `manipulation/` | `ManipulationRule`, candidate/realized matching, cluster-label scoring, rule loading |
 | `boost.py` | `RegexBoostClassifier` — gradient-boosted ensemble of regex rules |
-| `tree.py` | `RegexTreeClassifier` — decision tree with regex splits (Gini impurity) |
-| `rule.py` | `Rule` dataclass + matching engine + logit accumulation |
-| `scoring.py` | Softmax, cross-entropy, gradients, candidate scoring |
-| `prompt.py` | Prompt templates, LLM response parsing, description generation |
-| `display.py` | `.patterns()`, `.description()`, `.matches()`, `.rules()` mixin |
-| `llm/` | Abstract `LLMClient` protocol + Gemini 2.5 Flash implementation |
+| `tree.py` | `RegexTreeClassifier` — decision tree with regex splits |
+| `rule.py` | Regex `Rule` dataclass + logit accumulation |
+| `scoring.py` | Softmax, cross-entropy, gradients, objective functions |
+| `lasso.py` | L1 weight refit on regex match matrix |
+| `prompt.py` | Prompt templates for regex generation |
+| `display.py` | `.patterns()`, `.description()`, `.matches()`, `.rules()` |
+| `llm/` | `LLMClient` protocol + Gemini implementation |
 
-## Eval Results (step_cluster.feather, one-vs-rest)
+## Package boundary
 
-42,586 math steps across 94 clusters. 5 boosting steps per cluster, Gemini 2.5 Flash (no thinking), ~7s per cluster.
+| In regextree (library) | In regextree-agent (service) |
+|------------------------|------------------------------|
+| Manipulation matching + scoring | Docker orchestration |
+| Regex boosting | Claude agent prompts |
+| Rule loading from Python modules | `discover_manipulations_claude()` |
+| Unit tests | Eval scripts, domain × cluster loops |
 
-| Cluster | n_pos | Accuracy | F1 | Precision | Recall |
-|---------|-------|----------|------|-----------|--------|
-| 4 | 1556 | 0.900 | 0.341 | 0.225 | 0.707 |
-| 1 | 1548 | 0.881 | 0.336 | 0.211 | 0.829 |
-| 64 | 328 | 0.875 | 0.098 | 0.052 | 0.879 |
-| 83 | 228 | 0.938 | 0.145 | 0.079 | 0.978 |
-| 46 | 438 | 0.247 | 0.026 | 0.013 | 0.989 |
+## Tests
 
-**Mean F1: 0.19** — high recall, low precision. Regexes are too broad without domain separation (structurally similar clusters like 64/83 share patterns).
-
-## Known Issues / Next Steps
-
-- **Domain split needed**: splitting data by math domain before fitting should dramatically improve precision by removing confusers from the negative pool
-- **Refinement prompts**: show the LLM its false positives and ask it to tighten the regex
-- **Precision thresholds**: reject candidates that fire on >X% of negatives
-- **More boosting steps**: 5 steps is conservative; 10-20 may help with fine-grained clusters
+```bash
+pytest tests/ -v
+```
