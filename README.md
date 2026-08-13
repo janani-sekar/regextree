@@ -99,6 +99,56 @@ def apply_my_manipulation(prev_expr):
 rule = ManipulationRule(name="...", description="...", apply_fn=apply_my_manipulation)
 ```
 
+### Manipulation bank
+
+A bank accumulates discovered manipulations across discovery runs. `ManipulationRule`
+holds a live `apply_fn`, so the bank stores the exported module *source* and reloads
+rules through `load_rule_from_module` — discovery output stays auditable.
+
+```python
+from regextree import ManipulationBank
+
+bank = ManipulationBank("outputs/bank")
+entry = bank.add(
+    "outputs/ws_lin6/exports/results.py",
+    provenance={"step_group": "Q7", "response_group": "R2", "domain": "linear_equations"},
+    stats=result.val_metrics,
+)
+
+entry.manipulation_id   # "collapse_distributed_parenthesis_to_monomial_a1b2c3d4"
+bank.manifest()         # DataFrame: ids, names, flattened provenance_* / stats_* columns
+bank.load(entry.manipulation_id)
+bank.rules()            # {manipulation_id: ManipulationRule}
+```
+
+Ids default to `<rule name>_<8 char source hash>`, so re-adding an identical export is
+a no-op rather than a duplicate.
+
+### Full-dataset labeling
+
+Label every transition against every banked manipulation. One row per
+(transition, manipulation), with `manipulation_candidate` alongside
+`manipulation_realized` because the psychometric regressions run on the
+candidate subpopulation.
+
+```python
+from regextree import label_transitions, summarize_labels
+
+labels = label_transitions(
+    transition_observed_df,   # needs transition_id, prev_expr, curr_expr, step_correct
+    bank.rules(),
+)
+summarize_labels(labels)      # per-manipulation coverage and realization rates
+```
+
+By default a correct step is never realized (the `s32` convention); such matches are
+reported as `manipulation_false_positive`. Pass `realized_requires_incorrect=False` to
+score realization purely structurally, which is what the response-group decomposition
+implies when it does not restrict to incorrect transitions.
+
+Rule outputs are cached per distinct previous expression, so cost scales with unique
+expressions rather than rows: 6k transitions × 4 manipulations takes ~0.3s.
+
 ## Regex boosting
 
 ```python
@@ -135,7 +185,7 @@ Pass `subgroup_labels=` (e.g. cluster IDs) to prefer structurally similar confus
 
 | Module | Role |
 |--------|------|
-| `manipulation/` | `ManipulationRule`, candidate/realized matching, cluster-label scoring, rule loading |
+| `manipulation/` | `ManipulationRule`, candidate/realized matching, cluster-label scoring, rule loading, bank persistence, full-dataset labeling |
 | `boost.py` | `RegexBoostClassifier` — gradient-boosted ensemble of regex rules |
 | `tree.py` | `RegexTreeClassifier` — decision tree with regex splits |
 | `rule.py` | Regex `Rule` dataclass + logit accumulation |
@@ -152,7 +202,15 @@ Pass `subgroup_labels=` (e.g. cluster IDs) to prefer structurally similar confus
 | Manipulation matching + scoring | Docker orchestration |
 | Regex boosting | Claude agent prompts |
 | Rule loading from Python modules | `discover_manipulations_claude()` |
+| Bank persistence + full-dataset labeling | Expression parsing via `efm.Parser` |
 | Unit tests | Eval scripts, domain × cluster loops |
+
+## Pipeline status
+
+`docs/handoff.md` tracks what these libraries currently do versus what the misconception
+discovery pipeline asks for: the manipulation bank and full-dataset labeling that landed, the
+proposed adaptation of discovery to step groups and response groups ($Q$, $R$), and the two
+open semantics decisions.
 
 ## Tests
 
